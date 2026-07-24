@@ -1,0 +1,2398 @@
+import asyncio
+import os
+import shutil
+import socket
+import stat
+import subprocess
+import tempfile
+import time
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest import mock
+
+from vice import app as app_mod
+from vice import config as config_mod
+from vice import main as main_mod
+from vice.config import Config, HotkeyClipPreset, HotkeyConfig, OutputConfig, RecordingConfig, SharingConfig
+from vice.recorder import (
+    GSRRecorder,
+    SegmentRecorder,
+    _classify_gsr_source,
+    _gsr_audio_args,
+    _gsr_wants_disk_replay,
+    _is_wayland,
+    _wf_audio_device,
+    create_recorder,
+    list_display_options,
+    list_gsr_audio_sources,
+    _wait_for_finalized_clip,
+    _encoder_flags,
+    _next_clip_path,
+    _render_clip_name,
+)
+from vice.runtime import (
+    _wayland_runtime_dir_candidates,
+    actual_home_dir,
+    normalize_runtime_environment,
+)
+
+try:
+    from vice.share import ShareServer
+except ModuleNotFoundError:
+    ShareServer = None
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def _stub_ffprobe(_: Path) -> dict:
+    return {"width": 1920, "height": 1080, "duration": 4.2}
+
+
+class RuntimeEnvironmentTests(unittest.TestCase):
+    def test_normalize_runtime_environment_replaces_unexpanded_service_values(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": "${HOME}", "XDG_RUNTIME_DIR": "/run/user/$(id -u)"},
+            clear=False,
+        ):
+            with mock.patch("vice.runtime.shutil.which", return_value=None):
+                normalize_runtime_environment()
+            self.assertEqual(os.environ["HOME"], str(actual_home_dir()))
+            self.assertEqual(os.environ["XDG_RUNTIME_DIR"], f"/run/user/{os.getuid()}")
+
+    def test_normalize_runtime_environment_loads_display_vars_from_systemd(self) -> None:
+        systemd_env = "\n".join(
+            [
+                "WAYLAND_DISPLAY=wayland-1",
+                f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}",
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+                "XDG_SESSION_TYPE=wayland",
+            ]
+        )
+        with mock.patch.dict(os.environ, {"HOME": "${HOME}"}, clear=True):
+            with mock.patch("vice.runtime.shutil.which", return_value="/usr/bin/systemctl"):
+                with mock.patch("vice.runtime.subprocess.check_output", return_value=systemd_env):
+                    normalize_runtime_environment()
+            self.assertEqual(os.environ["HOME"], str(actual_home_dir()))
+            self.assertEqual(os.environ["WAYLAND_DISPLAY"], "wayland-1")
+            self.assertEqual(os.environ["XDG_RUNTIME_DIR"], f"/run/user/{os.getuid()}")
+            self.assertEqual(os.environ["XDG_SESSION_TYPE"], "wayland")
+
+    def test_wayland_runtime_dir_candidates_include_tmp_fallback(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}, clear=True):
+            candidates = _wayland_runtime_dir_candidates()
+
+        self.assertIn(Path(f"/run/user/{os.getuid()}"), candidates)
+        self.assertIn(Path(f"/tmp/wayland-{os.getuid()}"), candidates)
+
+    def test_normalize_runtime_environment_recovers_wayland_socket_without_systemd(self) -> None:
+        runtime_dir = mock.MagicMock()
+        runtime_dir.exists.return_value = True
+        runtime_dir.__str__.return_value = "/tmp/vice-runtime"
+        candidate = mock.MagicMock()
+        candidate.name = "wayland-9"
+        candidate.stat.return_value = mock.Mock(st_mode=stat.S_IFSOCK)
+        runtime_dir.glob.return_value = [candidate]
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": "${HOME}", "XDG_RUNTIME_DIR": "/run/user/$(id -u)"},
+            clear=True,
+        ):
+            with mock.patch("vice.runtime.shutil.which", return_value=None):
+                with mock.patch(
+                    "vice.runtime._wayland_runtime_dir_candidates",
+                    return_value=[runtime_dir],
+                ):
+                    normalize_runtime_environment()
+            self.assertEqual(os.environ["HOME"], str(actual_home_dir()))
+            self.assertEqual(os.environ["WAYLAND_DISPLAY"], "wayland-9")
+            self.assertEqual(os.environ["XDG_RUNTIME_DIR"], "/tmp/vice-runtime")
+
+    def test_normalize_runtime_environment_leaves_display_unset_without_socket(self) -> None:
+        runtime_dir = mock.MagicMock()
+        runtime_dir.exists.return_value = True
+        runtime_dir.glob.return_value = []
+
+        with mock.patch.dict(os.environ, {"HOME": "${HOME}"}, clear=True):
+            with mock.patch("vice.runtime.shutil.which", return_value=None):
+                with mock.patch(
+                    "vice.runtime._wayland_runtime_dir_candidates",
+                    return_value=[runtime_dir],
+                ):
+                    normalize_runtime_environment()
+            self.assertEqual(os.environ["HOME"], str(actual_home_dir()))
+            self.assertNotIn("WAYLAND_DISPLAY", os.environ)
+            self.assertNotIn("DISPLAY", os.environ)
+            self.assertEqual(os.environ["XDG_RUNTIME_DIR"], f"/run/user/{os.getuid()}")
+
+    def test_normalize_runtime_environment_repairs_runtime_dir_without_overwriting_valid_display(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": "${HOME}",
+                "WAYLAND_DISPLAY": "wayland-3",
+                "DISPLAY": ":1",
+                "XDG_RUNTIME_DIR": "/run/user/$(id -u)",
+            },
+            clear=True,
+        ):
+            with mock.patch("vice.runtime.shutil.which", return_value=None):
+                normalize_runtime_environment()
+                self.assertEqual(os.environ["WAYLAND_DISPLAY"], "wayland-3")
+                self.assertEqual(os.environ["DISPLAY"], ":1")
+                self.assertEqual(os.environ["XDG_RUNTIME_DIR"], f"/run/user/{os.getuid()}")
+
+    def test_normalize_runtime_environment_logs_before_and_after_snapshots(self) -> None:
+        with mock.patch.dict(os.environ, {"HOME": "${HOME}"}, clear=True):
+            with mock.patch("vice.runtime.shutil.which", return_value=None):
+                with mock.patch("vice.runtime.log.debug") as debug_mock:
+                    normalize_runtime_environment()
+
+        debug_mock.assert_any_call("Runtime env before normalization: %s", mock.ANY)
+        debug_mock.assert_any_call("Runtime env after normalization: %s", mock.ANY)
+
+
+class WebviewEnvironmentTests(unittest.TestCase):
+    def test_sets_default_chromium_flags(self) -> None:
+        env = {"LANG": "en_US.UTF-8"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=False):
+                app_mod._prepare_webview_environment()
+            flags = os.environ["QTWEBENGINE_CHROMIUM_FLAGS"]
+
+        self.assertIn("--disable-accelerated-video-decode", flags)
+        self.assertNotIn("Vulkan", flags)
+        self.assertNotIn("--disable-gpu-compositing", flags)
+
+    def test_qt_logging_forced_to_stderr(self) -> None:
+        # Qt sends warnings to journald when stderr is not a TTY, which
+        # blinded the compositor watcher for app-launcher starts (the
+        # black-window failure only self-healed from a terminal).
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8"}, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=False):
+                app_mod._prepare_webview_environment()
+            self.assertEqual(os.environ["QT_LOGGING_TO_CONSOLE"], "1")
+
+    def test_compositor_failure_triggers(self) -> None:
+        # QtWebEngine prints the GBM line on every NVIDIA start and then
+        # renders fine over Vulkan, so it must not condemn the run. Only
+        # the repeating black-window markers do, once past the threshold.
+        hits, relaunch = app_mod._compositor_failure_hit(
+            b"GBM is not supported with the current configuration. "
+            b"Fallback to Vulkan rendering in Chromium.", 0
+        )
+        self.assertFalse(relaunch)
+
+        hits = 0
+        for i in range(app_mod._COMPOSITOR_FAILURE_THRESHOLD):
+            hits, relaunch = app_mod._compositor_failure_hit(
+                b"Compositor returned null texture", hits
+            )
+            self.assertEqual(relaunch, i == app_mod._COMPOSITOR_FAILURE_THRESHOLD - 1)
+
+        hits, relaunch = app_mod._compositor_failure_hit(b"some harmless line", 0)
+        self.assertEqual((hits, relaunch), (0, False))
+
+    def test_nvidia_gets_gpu_compositing_by_default(self) -> None:
+        # GPU compositing is the default; software compositing only
+        # applies to a run explicitly relaunched with
+        # VICE_WEBVIEW_SOFTWARE=1. Nothing is persisted: the GBM failure
+        # is intermittent, so every fresh launch tries the GPU first.
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8"}, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=True):
+                with mock.patch("vice.app._nvidia_driver_major", return_value=610):
+                    app_mod._prepare_webview_environment()
+            flags = os.environ["QTWEBENGINE_CHROMIUM_FLAGS"]
+
+        self.assertNotIn("--disable-gpu-compositing", flags)
+
+    def test_vulkan_blocked_only_on_the_old_driver_series(self) -> None:
+        # Vulkan is the only GPU path left once QtWebEngine rejects GBM, so
+        # blocking it on every NVIDIA machine forced software compositing.
+        def flags_for(major):
+            with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8"}, clear=True):
+                with mock.patch("vice.app._is_nvidia", return_value=True):
+                    with mock.patch("vice.app._nvidia_driver_major", return_value=major):
+                        app_mod._prepare_webview_environment()
+                return os.environ["QTWEBENGINE_CHROMIUM_FLAGS"]
+
+        self.assertIn("--disable-features=Vulkan", flags_for(535))
+        self.assertNotIn("--disable-features=Vulkan", flags_for(610))
+        # An unreadable version is not a reason to downgrade the machine.
+        self.assertNotIn("--disable-features=Vulkan", flags_for(None))
+
+    def test_nvidia_driver_major_parses_the_proc_file(self) -> None:
+        text = ("NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  "
+                "610.43.02  Release Build\nGCC version: gcc 16.1.1\n")
+        with mock.patch("pathlib.Path.read_text", return_value=text):
+            self.assertEqual(app_mod._nvidia_driver_major(), 610)
+
+    def test_software_env_var_enables_software_compositing_for_this_run(self) -> None:
+        env = {"LANG": "en_US.UTF-8", "VICE_WEBVIEW_SOFTWARE": "1"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=True):
+                app_mod._prepare_webview_environment()
+            flags = os.environ["QTWEBENGINE_CHROMIUM_FLAGS"]
+
+        self.assertIn("--disable-gpu-compositing", flags)
+
+    def test_nvidia_on_wayland_prefers_xwayland_platform(self) -> None:
+        # Chromium's native-Wayland GBM path is flaky on NVIDIA (same
+        # machine accepts GBM on one launch, rejects it on the next);
+        # the XWayland GL path is stable.
+        env = {"LANG": "en_US.UTF-8", "WAYLAND_DISPLAY": "wayland-1",
+               "QT_QPA_PLATFORM": "wayland;xcb"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=True):
+                app_mod._prepare_webview_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb")
+
+        # Explicit override wins.
+        env["VICE_WEBVIEW_PLATFORM"] = "wayland"
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=True):
+                app_mod._prepare_webview_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
+
+        # Non-NVIDIA setups keep whatever Qt would pick.
+        env = {"LANG": "en_US.UTF-8", "WAYLAND_DISPLAY": "wayland-1"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=False):
+                app_mod._prepare_webview_environment()
+            self.assertNotIn("QT_QPA_PLATFORM", os.environ)
+
+    def test_user_flags_are_respected(self) -> None:
+        env = {"LANG": "en_US.UTF-8", "QTWEBENGINE_CHROMIUM_FLAGS": "--my-flag"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            app_mod._prepare_webview_environment()
+            self.assertEqual(os.environ["QTWEBENGINE_CHROMIUM_FLAGS"], "--my-flag")
+
+    def test_extra_flags_are_appended(self) -> None:
+        env = {"LANG": "en_US.UTF-8", "VICE_WEBVIEW_FLAGS": "--extra-flag"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=False):
+                app_mod._prepare_webview_environment()
+            self.assertIn("--extra-flag", os.environ["QTWEBENGINE_CHROMIUM_FLAGS"])
+
+    def test_c_locale_is_replaced_with_utf8(self) -> None:
+        # Qt switches away from a C locale with loud warnings; systemd
+        # user services often start without any locale at all (#82).
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=False):
+                app_mod._prepare_webview_environment()
+            self.assertEqual(os.environ["LC_ALL"], "C.UTF-8")
+
+        with mock.patch.dict(os.environ, {"LANG": "de_DE.UTF-8"}, clear=True):
+            with mock.patch("vice.app._is_nvidia", return_value=False):
+                app_mod._prepare_webview_environment()
+            self.assertNotIn("LC_ALL", os.environ)
+
+
+class AppStartupTests(unittest.TestCase):
+    def test_start_daemon_passes_normalized_environment_to_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "vice.sock"
+            with mock.patch.object(app_mod, "SOCKET_FILE", socket_path):
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    with mock.patch("vice.app._vice_cmd", return_value=["vice"]):
+                        with mock.patch(
+                            "vice.app.normalize_runtime_environment",
+                            side_effect=lambda: os.environ.__setitem__("WAYLAND_DISPLAY", "wayland-7"),
+                        ) as normalize_mock:
+                            with mock.patch("vice.app.subprocess.Popen") as popen_mock:
+                                app_mod._start_daemon()
+
+        normalize_mock.assert_called_once()
+        self.assertEqual(popen_mock.call_args.kwargs["env"]["WAYLAND_DISPLAY"], "wayland-7")
+
+    def test_ensure_server_reuses_healthy_daemon_url(self) -> None:
+        with mock.patch(
+            "vice.app._daemon_status",
+            return_value={"local_url": "http://127.0.0.1:9001", "ready": True},
+        ):
+            with mock.patch("vice.app._wait_for_server", return_value=True) as wait_mock:
+                with mock.patch("vice.app._start_daemon") as start_mock:
+                    url = app_mod._ensure_server("http://localhost:8765/")
+
+        self.assertEqual(url, "http://127.0.0.1:9001/")
+        self.assertEqual(wait_mock.call_args_list[0], mock.call("http://127.0.0.1:9001/", timeout=2.0))
+        start_mock.assert_not_called()
+
+    def test_ensure_server_waits_for_ready_daemon_after_http_responds(self) -> None:
+        statuses = [
+            None,
+            {"local_url": "http://127.0.0.1:8765", "ready": False},
+            {"local_url": "http://127.0.0.1:8765", "ready": True},
+        ]
+        with mock.patch("vice.app._daemon_status", side_effect=statuses):
+            with mock.patch("vice.app._wait_for_server", return_value=True):
+                with mock.patch("vice.app._start_daemon") as start_mock:
+                    url = app_mod._ensure_server("http://127.0.0.1:8765/", startup_timeout=1.0)
+
+        self.assertEqual(url, "http://127.0.0.1:8765/")
+        start_mock.assert_called_once()
+
+    def test_app_main_uses_ipv4_loopback_url(self) -> None:
+        fake_cfg = mock.Mock()
+        fake_cfg.sharing.port = 8765
+        with mock.patch("vice.app.normalize_runtime_environment"):
+            with mock.patch("vice.app._setup_logging"):
+                with mock.patch("vice.app.signal.signal"):
+                    with mock.patch("vice.config.load", return_value=fake_cfg):
+                        with mock.patch("vice.app._ensure_server", return_value=None) as ensure_mock:
+                            with mock.patch("vice.app._startup_failure_detail", return_value="detail") as detail_mock:
+                                with mock.patch("vice.app._show_error"):
+                                    with self.assertRaises(SystemExit):
+                                        app_mod.main()
+
+        ensure_mock.assert_called_once_with("http://127.0.0.1:8765/")
+        detail_mock.assert_called_once_with("http://127.0.0.1:8765/")
+
+    def test_ensure_server_restarts_when_ipc_is_alive_but_http_is_dead(self) -> None:
+        with mock.patch("vice.app._daemon_status", side_effect=[
+            {"local_url": "http://127.0.0.1:9001"},
+            {"local_url": "http://127.0.0.1:8765", "ready": True},
+        ]):
+            with mock.patch("vice.app._wait_for_server", side_effect=[False, True]) as wait_mock:
+                with mock.patch("vice.app._stop_daemon") as stop_mock:
+                    with mock.patch("vice.app._wait_for_daemon_exit", return_value=True):
+                        with mock.patch("vice.app._clear_stale_socket") as clear_mock:
+                            with mock.patch("vice.app._start_daemon") as start_mock:
+                                with mock.patch("vice.app.time.sleep"):
+                                    url = app_mod._ensure_server("http://127.0.0.1:8765/")
+
+        self.assertEqual(url, "http://127.0.0.1:8765/")
+        stop_mock.assert_called_once()
+        clear_mock.assert_called_once()
+        start_mock.assert_called_once()
+        self.assertEqual(wait_mock.call_args_list[0].kwargs["timeout"], 2.0)
+        self.assertEqual(wait_mock.call_args_list[1].kwargs["timeout"], 1.0)
+
+    def test_startup_failure_detail_includes_daemon_log_tail_when_ipc_never_appears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "vice.log"
+            daemon_log.write_text("first line\nsecond line\n")
+            with mock.patch.object(app_mod, "DAEMON_LOG_FILE", daemon_log):
+                with mock.patch("vice.app._daemon_status", return_value=None):
+                    detail = app_mod._startup_failure_detail("http://localhost:8765/")
+
+        self.assertIn("Daemon IPC socket did not become ready.", detail)
+        self.assertIn("second line", detail)
+
+    def test_startup_failure_detail_reports_http_outage_when_ipc_is_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "vice.log"
+            daemon_log.write_text("backend failed\n")
+            with mock.patch.object(app_mod, "DAEMON_LOG_FILE", daemon_log):
+                with mock.patch(
+                    "vice.app._daemon_status",
+                    return_value={"local_url": "http://127.0.0.1:9001"},
+                ):
+                    detail = app_mod._startup_failure_detail("http://localhost:8765/")
+
+        self.assertIn("Daemon IPC responded but HTTP UI is unavailable at http://127.0.0.1:9001/", detail)
+        self.assertIn("backend failed", detail)
+
+    def test_startup_failure_detail_explains_known_gsr_crash(self) -> None:
+        """A raw 'failed to load opengl' traceback tells the user nothing about
+        what to do next, so the dialog leads with the cause."""
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon_log = Path(tmp) / "vice.log"
+            daemon_log.write_text(
+                "RuntimeError: gpu-screen-recorder failed to start: "
+                "gsr error: failed to load opengl\n"
+            )
+            with mock.patch.object(app_mod, "DAEMON_LOG_FILE", daemon_log):
+                with mock.patch("vice.app._daemon_status", return_value=None):
+                    detail = app_mod._startup_failure_detail("http://localhost:8765/")
+
+        self.assertTrue(detail.startswith("gpu-screen-recorder could not create"))
+        self.assertIn("vice doctor", detail)
+        # The raw log stays available underneath the explanation.
+        self.assertIn("failed to load opengl", detail)
+
+    def test_startup_failure_detail_stays_raw_for_unknown_crashes(self) -> None:
+        self.assertIsNone(app_mod._diagnose_startup_failure("ZeroDivisionError: nope"))
+
+
+class ConfigPathResolutionTests(unittest.TestCase):
+    def test_default_config_enables_discord_rich_presence(self) -> None:
+        self.assertTrue(Config().discord.enabled)
+
+    def test_load_expands_home_placeholders_in_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+            config_path.write_text('[output]\ndirectory = "$HOME/Videos/Vice"\n')
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    cfg = config_mod.load()
+
+        self.assertEqual(cfg.output.directory, str(actual_home_dir() / "Videos" / "Vice"))
+
+    def test_load_preserves_existing_discord_disabled_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+            config_path.write_text("[discord]\nenabled = false\n")
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    cfg = config_mod.load()
+
+        self.assertFalse(cfg.discord.enabled)
+
+    def test_save_and_load_preserve_recording_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+
+            cfg = Config(
+                recording=RecordingConfig(
+                    capture_microphone=True,
+                    microphone_source="device:alsa_input.usb-guitar",
+                    wf_microphone_strategy="backend_fallback",
+                    display="DP-1",
+                    gsr_audio_source="app:firefox",
+                    audio_tracks=["default_output", "app:Discord"],
+                    audio_tracks_mix_first=True,
+                )
+            )
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    config_mod.save(cfg)
+                    loaded = config_mod.load()
+
+        self.assertTrue(loaded.recording.capture_microphone)
+        self.assertEqual(loaded.recording.microphone_source, "device:alsa_input.usb-guitar")
+        self.assertEqual(loaded.recording.wf_microphone_strategy, "backend_fallback")
+        self.assertEqual(loaded.recording.display, "DP-1")
+        self.assertEqual(loaded.recording.gsr_audio_source, "app:firefox")
+        self.assertEqual(loaded.recording.audio_tracks, ["default_output", "app:Discord"])
+        self.assertTrue(loaded.recording.audio_tracks_mix_first)
+
+    def test_load_ignores_unknown_config_keys(self) -> None:
+        # A config written by a newer Vice must not crash an older daemon:
+        # 1.2.x died at startup on the recording keys 1.3.0 added.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+            config_path.write_text(
+                "[recording]\n"
+                "fps = 30\n"
+                "some_future_key = \"surprise\"\n"
+                "[sharing]\n"
+                "port = 9000\n"
+                "another_future_key = 7\n"
+            )
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    loaded = config_mod.load()
+
+        self.assertEqual(loaded.recording.fps, 30)
+        self.assertEqual(loaded.sharing.port, 9000)
+
+    def test_save_and_load_preserve_clip_presets_and_grow_buffer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+
+            cfg = Config(
+                recording=RecordingConfig(buffer_duration=60, clip_duration=15),
+                hotkeys=HotkeyConfig(
+                    clip="KEY_F9",
+                    clip_presets=[HotkeyClipPreset(key="KEY_F6", duration=120)],
+                ),
+            )
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    config_mod.save(cfg)
+                    loaded = config_mod.load()
+
+        self.assertEqual(loaded.hotkeys.clip_presets[0].key, "KEY_F6")
+        self.assertEqual(loaded.hotkeys.clip_presets[0].duration, 120)
+        self.assertEqual(loaded.recording.buffer_duration, 120)
+
+    def test_load_ignores_malformed_clip_presets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+            config_path.write_text(
+                "[hotkeys]\n"
+                "clip = \"KEY_F9\"\n"
+                "[[hotkeys.clip_presets]]\n"
+                "key = \"\"\n"
+                "duration = 60\n"
+                "[[hotkeys.clip_presets]]\n"
+                "key = \"KEY_F6\"\n"
+                "duration = 90\n"
+            )
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    loaded = config_mod.load()
+
+        self.assertEqual(len(loaded.hotkeys.clip_presets), 1)
+        self.assertEqual(loaded.hotkeys.clip_presets[0].key, "KEY_F6")
+
+
+@unittest.skipUnless(ShareServer is not None, "aiohttp is not installed")
+class ShareServerPathResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_preloads_clips_from_resolved_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "clips"
+            output_dir.mkdir()
+            clip_path = output_dir / "clip.mp4"
+            clip_path.write_bytes(b"not-a-real-mp4")
+
+            local_port = _free_port()
+            public_port = _free_port()
+            while public_port == local_port:
+                public_port = _free_port()
+            cfg = Config(
+                output=OutputConfig(directory="$HOME/Videos/Vice"),
+                sharing=SharingConfig(
+                    port=local_port,
+                    public_port=public_port,
+                    cloudflare_tunnel=False,
+                ),
+            )
+            server = ShareServer(cfg)
+
+            with mock.patch("vice.share.resolve_path", return_value=output_dir):
+                with mock.patch("vice.share._local_ip", return_value="127.0.0.1"):
+                    with mock.patch("vice.share._ffprobe", new=_stub_ffprobe):
+                        await server.start()
+                        try:
+                            self.assertIn("clip", server._clips)
+                        finally:
+                            await server.stop()
+
+
+class RecorderEnvironmentTests(unittest.TestCase):
+    def test_is_wayland_delegates_to_runtime_recovery(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("vice.recorder.recover_wayland_display", return_value=True) as recover_mock:
+                self.assertTrue(_is_wayland())
+        recover_mock.assert_called_once()
+
+
+class _FakeHotkeys:
+    available = True
+
+    def __init__(self) -> None:
+        self.single: dict[str, list] = {}
+        self.double: dict[str, list] = {}
+
+    def clear_bindings(self) -> None:
+        self.single.clear()
+        self.double.clear()
+
+    def on(self, key, callback) -> None:
+        self.single.setdefault(key, []).append(callback)
+
+    def on_double(self, key, callback) -> None:
+        self.double.setdefault(key, []).append(callback)
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+class _FakeRecorder:
+    def __init__(self, result=None) -> None:
+        self.name = "fake"
+        self._result = result
+        self.save_calls = 0
+        self.save_durations: list[int | None] = []
+        self._cb = None
+        self.healthy = True
+        self.heal_on_start = False
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.start_error: Exception | None = None
+
+    def on_clip_saved(self, cb) -> None:
+        self._cb = cb
+
+    def is_healthy(self) -> bool:
+        return self.healthy
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+        if self.heal_on_start:
+            self.healthy = True
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+    async def save_clip(self, duration=None):
+        self.save_calls += 1
+        self.save_durations.append(duration)
+        await asyncio.sleep(0)
+        return self._result
+
+    def session_elapsed(self) -> float:
+        return 0.0
+
+
+class _FakeShare:
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
+    async def broadcast(self, msg: dict) -> None:
+        self.messages.append(msg)
+
+
+class ViceDaemonClipFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clip_trigger_broadcasts_progress_and_error(self) -> None:
+        recorder = _FakeRecorder(result=None)
+        with mock.patch("vice.main.load_config", return_value=Config()):
+            with mock.patch("vice.main.create_recorder", return_value=recorder):
+                with mock.patch("vice.main.HotkeyListener", return_value=_FakeHotkeys()):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+
+        daemon.share = _FakeShare()
+
+        with mock.patch("vice.main.audio.play_clip"):
+            await daemon._handle_clip_hotkey()
+            self.assertIsNotNone(daemon._clip_task)
+            await daemon._clip_task
+
+        self.assertEqual(recorder.save_calls, 1)
+        self.assertEqual(
+            [msg["type"] for msg in daemon.share.messages],
+            ["clip_saving", "clip_error"],
+        )
+
+    async def test_clip_trigger_passes_requested_duration(self) -> None:
+        recorder = _FakeRecorder(result=None)
+        with mock.patch("vice.main.load_config", return_value=Config()):
+            with mock.patch("vice.main.create_recorder", return_value=recorder):
+                with mock.patch("vice.main.HotkeyListener", return_value=_FakeHotkeys()):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+
+        with mock.patch("vice.main.audio.play_clip"):
+            await daemon._handle_clip_hotkey(90)
+            await daemon._clip_task
+
+        self.assertEqual(recorder.save_durations, [90])
+
+    async def test_config_restart_rewires_game_tag_callback(self) -> None:
+        """A settings change swaps in a new recorder. If it doesn't get the tag
+        callback, filename tagging and auto playlists silently stop working."""
+        first = _FakeRecorder()
+        second = _FakeRecorder()
+        with mock.patch("vice.main.load_config", return_value=Config()):
+            with mock.patch("vice.main.create_recorder", return_value=first):
+                with mock.patch("vice.main.HotkeyListener", return_value=_FakeHotkeys()):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+
+        # _wire_recorder must set both callbacks, not just on_clip_saved.
+        daemon._wire_recorder(first)
+        self.assertEqual(first._cb, daemon._on_clip_saved)
+        self.assertEqual(first.clip_tag_cb, daemon._clip_game_tag)
+
+        # A config change swaps in a new recorder; it must be wired the same way
+        # or game tagging and auto playlists silently stop after any settings edit.
+        daemon._session_active = False
+        with mock.patch("vice.main.create_recorder", return_value=second):
+            applied = await daemon._restart_recorder_for_config()
+
+        self.assertTrue(applied)
+        self.assertIs(daemon.recorder, second)
+        self.assertEqual(second._cb, daemon._on_clip_saved)
+        self.assertEqual(second.clip_tag_cb, daemon._clip_game_tag)
+
+    async def test_bind_hotkeys_registers_primary_and_preset_keys(self) -> None:
+        hotkeys = _FakeHotkeys()
+        cfg = Config(
+            recording=RecordingConfig(clip_duration=15),
+            hotkeys=HotkeyConfig(
+                clip="KEY_F9",
+                clip_presets=[HotkeyClipPreset(key="KEY_F6", duration=60)],
+            ),
+        )
+        with mock.patch("vice.main.load_config", return_value=cfg):
+            with mock.patch("vice.main.create_recorder", return_value=_FakeRecorder()):
+                with mock.patch("vice.main.HotkeyListener", return_value=hotkeys):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+
+        daemon._bind_hotkeys()
+
+        self.assertEqual(set(hotkeys.single), {"KEY_F9", "KEY_F6"})
+        self.assertEqual(set(hotkeys.double), {"KEY_F9", "KEY_F6"})
+
+    async def test_clip_game_tag_matches_a_known_game_and_records_it(self) -> None:
+        """End to end for the reporter's case: a focused Outer Wilds window
+        yields a filename tag and sets the game used for the auto playlist."""
+        cfg = Config(output=OutputConfig(tag_clips_with_game=True))
+        with mock.patch("vice.main.load_config", return_value=cfg):
+            with mock.patch("vice.main.create_recorder", return_value=_FakeRecorder()):
+                with mock.patch("vice.main.HotkeyListener", return_value=_FakeHotkeys()):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+
+        win = {"process": "OuterWilds", "class": "OuterWilds", "pid": 1}
+        with mock.patch("vice.active_window.get_active_window", return_value=win):
+            tag = daemon._clip_game_tag()
+
+        # _clip_game_tag returns the raw game name; the recorder's _clip_tag
+        # sanitizes it into the filename.
+        self.assertEqual(tag, "Outer Wilds")
+        self.assertEqual(daemon._last_clip_game, "Outer Wilds")
+
+    async def test_clip_game_tag_still_records_game_when_filename_tag_off(self) -> None:
+        # Auto playlists must work even with filename tagging disabled.
+        cfg = Config(output=OutputConfig(tag_clips_with_game=False))
+        with mock.patch("vice.main.load_config", return_value=cfg):
+            with mock.patch("vice.main.create_recorder", return_value=_FakeRecorder()):
+                with mock.patch("vice.main.HotkeyListener", return_value=_FakeHotkeys()):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+
+        win = {"process": "OuterWilds", "class": "OuterWilds", "pid": 1}
+        with mock.patch("vice.active_window.get_active_window", return_value=win):
+            tag = daemon._clip_game_tag()
+
+        self.assertIsNone(tag)
+        self.assertEqual(daemon._last_clip_game, "Outer Wilds")
+
+
+class RecorderDurationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_segment_save_clip_uses_requested_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seg = root / "seg0001.mp4"
+            seg.write_bytes(b"segment")
+            out = root / "out.mp4"
+            recorder = SegmentRecorder(
+                Config(
+                    output=OutputConfig(directory=str(root)),
+                    recording=RecordingConfig(clip_duration=15),
+                ),
+                use_wf_recorder=False,
+            )
+            recorder._segments = [(900.0, seg)]
+            captured: dict[str, list[str]] = {}
+
+            class _Proc:
+                returncode = 0
+
+                async def communicate(self):
+                    out.write_bytes(b"clip")
+                    return b"", b""
+
+            async def _fake_exec(*cmd, **_kwargs):
+                captured["cmd"] = list(cmd)
+                return _Proc()
+
+            with mock.patch("vice.recorder.time.time", return_value=1000.0):
+                with mock.patch("vice.recorder._next_clip_path", return_value=out):
+                    with mock.patch("vice.recorder.asyncio.create_subprocess_exec", new=_fake_exec):
+                        saved = await recorder.save_clip(45)
+
+        self.assertEqual(saved, out)
+        self.assertEqual(captured["cmd"][captured["cmd"].index("-t") + 1], "45")
+
+
+class RecorderStabilizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_for_finalized_clip_waits_for_last_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "raw.mp4"
+
+            async def _writer() -> None:
+                await asyncio.sleep(0.02)
+                clip.write_bytes(b"a")
+                await asyncio.sleep(0.08)
+                clip.write_bytes(b"ab")
+                await asyncio.sleep(0.08)
+                clip.write_bytes(b"abc")
+
+            observed: list[bytes] = []
+
+            async def _fake_duration(path: Path) -> float:
+                observed.append(path.read_bytes())
+                return 30.0
+
+            writer = asyncio.create_task(_writer())
+            start = time.monotonic()
+            with mock.patch("vice.recorder._get_duration", new=_fake_duration):
+                ready = await _wait_for_finalized_clip(
+                    clip,
+                    stable_polls=3,
+                    poll_interval=0.03,
+                    inactivity_timeout=1.0,
+                    max_wait=5.0,
+                )
+            elapsed = time.monotonic() - start
+            await writer
+
+        self.assertTrue(ready)
+        self.assertGreaterEqual(elapsed, 0.18)
+        self.assertEqual(observed[-1], b"abc")
+
+    async def test_wait_for_finalized_clip_gives_up_after_write_inactivity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "raw.mp4"
+            clip.write_bytes(b"not a video")
+
+            async def _zero_duration(_: Path) -> float:
+                return 0.0
+
+            start = time.monotonic()
+            with mock.patch("vice.recorder._get_duration", new=_zero_duration):
+                ready = await _wait_for_finalized_clip(
+                    clip,
+                    stable_polls=2,
+                    poll_interval=0.02,
+                    inactivity_timeout=0.15,
+                    max_wait=5.0,
+                )
+            elapsed = time.monotonic() - start
+
+        self.assertFalse(ready)
+        self.assertLess(elapsed, 2.0)
+
+    async def test_wait_for_finalized_clip_tolerates_slow_writes(self) -> None:
+        """A file that keeps growing must not be abandoned, even when the
+        total write time exceeds the inactivity timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "raw.mp4"
+
+            async def _writer() -> None:
+                # Total write time (0.8 s) far exceeds the inactivity
+                # timeout (0.3 s); only the gaps between writes count.
+                data = b""
+                for _ in range(16):
+                    data += b"x" * 10
+                    clip.write_bytes(data)
+                    await asyncio.sleep(0.05)
+
+            durations = iter([0.0] * 2)
+
+            async def _fake_duration(_: Path) -> float:
+                return next(durations, 30.0)
+
+            writer = asyncio.create_task(_writer())
+            with mock.patch("vice.recorder._get_duration", new=_fake_duration):
+                ready = await _wait_for_finalized_clip(
+                    clip,
+                    stable_polls=2,
+                    poll_interval=0.03,
+                    inactivity_timeout=0.3,
+                    max_wait=5.0,
+                )
+            await writer
+
+        self.assertTrue(ready)
+
+    async def test_trim_copy_command_avoids_negative_timestamps(self) -> None:
+        captured: dict = {}
+
+        async def _fake_duration(_: Path) -> float:
+            return 100.0
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        async def _fake_exec(*cmd, **_kwargs):
+            captured["cmd"] = list(cmd)
+            return _Proc()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            clip.write_bytes(b"clip")
+            with mock.patch("vice.recorder._get_duration", new=_fake_duration):
+                with mock.patch(
+                    "vice.recorder.asyncio.create_subprocess_exec", new=_fake_exec
+                ):
+                    from vice.recorder import _trim_to_last_n_seconds
+
+                    await _trim_to_last_n_seconds(clip, 30)
+
+        cmd = captured["cmd"]
+        self.assertIn("-avoid_negative_ts", cmd)
+        self.assertEqual(cmd[cmd.index("-avoid_negative_ts") + 1], "make_zero")
+        self.assertIn("copy", cmd)
+
+    async def test_gsr_save_clip_waits_for_finalized_file_before_trim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            recorder = GSRRecorder(
+                Config(
+                    output=OutputConfig(directory=str(out_dir)),
+                    recording=RecordingConfig(clip_duration=30),
+                )
+            )
+            recorder._proc = mock.Mock(pid=1234, returncode=None)
+
+            raw_clip = out_dir / "gsr-auto.mp4"
+
+            async def _writer() -> None:
+                await asyncio.sleep(0.05)
+                raw_clip.write_bytes(b"clip")
+
+            async def _trim(path: Path, seconds: int) -> Path:
+                self.assertEqual(seconds, 45)
+                return path
+
+            writer = asyncio.create_task(_writer())
+            with mock.patch("vice.recorder.os.kill") as kill_mock:
+                with mock.patch("vice.recorder._wait_for_finalized_clip", new=mock.AsyncMock(return_value=True)) as wait_mock:
+                    with mock.patch("vice.recorder._trim_to_last_n_seconds", new=_trim):
+                        saved = await recorder.save_clip(45)
+            await writer
+
+        kill_mock.assert_called_once_with(1234, mock.ANY)
+        wait_mock.assert_awaited_once()
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.name, "Vice_Clip_1.mp4")
+
+    async def test_gsr_save_clip_ignores_files_that_predate_the_trigger(self) -> None:
+        # Regression: a session recording (or any file) that appeared after
+        # recorder start used to be claimed as "the new clip" on the next
+        # save, so the wrong video got renamed, trimmed, and shown.
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            recorder = GSRRecorder(
+                Config(
+                    output=OutputConfig(directory=str(out_dir)),
+                    recording=RecordingConfig(clip_duration=30),
+                )
+            )
+            recorder._proc = mock.Mock(pid=1234, returncode=None)
+
+            session = out_dir / "Vice_Session_1.mp4"
+            session.write_bytes(b"session recording")
+            stray = out_dir / "renamed-by-user.mp4"
+            stray.write_bytes(b"older clip")
+
+            raw_clip = out_dir / "Replay_2026-06-10_12-00-00.mp4"
+
+            async def _writer() -> None:
+                await asyncio.sleep(0.05)
+                raw_clip.write_bytes(b"new replay")
+
+            async def _trim(path: Path, seconds: int) -> Path:
+                return path
+
+            writer = asyncio.create_task(_writer())
+            with mock.patch("vice.recorder.os.kill"):
+                with mock.patch(
+                    "vice.recorder._wait_for_finalized_clip",
+                    new=mock.AsyncMock(return_value=True),
+                ):
+                    with mock.patch("vice.recorder._trim_to_last_n_seconds", new=_trim):
+                        saved = await recorder.save_clip()
+            await writer
+
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved.read_bytes(), b"new replay")
+            self.assertTrue(session.exists())
+            self.assertEqual(stray.read_bytes(), b"older clip")
+
+    def test_gsr_replay_candidates_excludes_vice_artifacts(self) -> None:
+        from vice.recorder import _gsr_replay_candidates
+
+        current = {
+            "Replay_2026-06-10_12-00-00.mp4",
+            "Vice_Clip_4.mp4",
+            "Vice_Session_2.mkv",
+            "Vice_Clip_3.trim.mp4",
+            "epic-headshot.trimming.mp4",
+            "Vice_Clip_2.wm.mp4",
+            "old-clip.fix.mkv",
+            "already-there.mp4",
+        }
+        new = _gsr_replay_candidates(current, baseline={"already-there.mp4"})
+
+        self.assertEqual(new, {"Replay_2026-06-10_12-00-00.mp4"})
+
+
+class ClipNamingTests(unittest.IsolatedAsyncioTestCase):
+    def test_next_clip_path_counts_tagged_and_mkv_clips(self) -> None:
+        from vice.recorder import _next_clip_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "Vice_Clip_1.mp4").write_bytes(b"x")
+            (out / "Vice_Clip_2_Overwatch-2.mkv").write_bytes(b"x")
+
+            untagged = _next_clip_path(out)
+            tagged = _next_clip_path(out, ext="mkv", tag="Deep-Rock-Galactic")
+
+        self.assertEqual(untagged.name, "Vice_Clip_3.mp4")
+        self.assertEqual(tagged.name, "Vice_Clip_3_Deep-Rock-Galactic.mkv")
+
+    async def test_clip_tag_is_sanitized_for_filenames(self) -> None:
+        recorder = GSRRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test"))
+        )
+        recorder.clip_tag_cb = lambda: "Overwatch 2: Beta!"
+
+        self.assertEqual(await recorder._clip_tag(), "Overwatch-2-Beta")
+
+        recorder.clip_tag_cb = lambda: None
+        self.assertIsNone(await recorder._clip_tag())
+
+        def _boom() -> str:
+            raise RuntimeError("window detection failed")
+
+        recorder.clip_tag_cb = _boom
+        self.assertIsNone(await recorder._clip_tag())
+
+
+class RecorderAudioCommandTests(unittest.TestCase):
+    def test_list_display_options_parses_gsr_capture_options(self) -> None:
+        gsr_out = "\n".join(
+            [
+                "window",
+                "screen",
+                "DP-1|2560x1440",
+                "HDMI-A-1|1920x1080",
+            ]
+        )
+
+        with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "gpu-screen-recorder"):
+            with mock.patch("vice.recorder._run_command_capture", return_value=(0, gsr_out)):
+                info = list_display_options("gsr")
+
+        self.assertEqual(info["backend"], "gsr")
+        self.assertEqual([d["id"] for d in info["displays"]], ["DP-1", "HDMI-A-1"])
+        self.assertEqual(info["displays"][0]["label"], "DP-1 (2560x1440)")
+
+    def test_list_display_options_parses_quoted_gsr_monitors(self) -> None:
+        gsr_out = "\n".join(
+            [
+                '"DP-4" (1920x1080+1920+0)',
+                '"HDMI-A-1" (1920x1080+0+0)',
+            ]
+        )
+
+        with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "gpu-screen-recorder"):
+            with mock.patch("vice.recorder._run_command_capture", return_value=(0, gsr_out)):
+                info = list_display_options("gsr")
+
+        self.assertEqual(info["backend"], "gsr")
+        self.assertEqual([d["id"] for d in info["displays"]], ["DP-4", "HDMI-A-1"])
+        self.assertEqual(info["displays"][0]["label"], "DP-4 (1920x1080+1920+0)")
+
+    def test_list_display_options_parses_xrandr_monitors(self) -> None:
+        xrandr_out = "\n".join(
+            [
+                "Monitors: 2",
+                " 0: +*DP-1 2560/600x1440/340+1920+0  DP-1",
+                " 1: +HDMI-1 1920/520x1080/290+0+0  HDMI-1",
+            ]
+        )
+
+        with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "xrandr"):
+            with mock.patch("vice.recorder.subprocess.check_output", return_value=xrandr_out):
+                info = list_display_options("ffmpeg")
+
+        self.assertEqual(info["backend"], "ffmpeg")
+        self.assertEqual([d["id"] for d in info["displays"]], ["DP-1", "HDMI-1"])
+        self.assertEqual(info["displays"][0]["x"], 1920)
+        self.assertEqual(info["displays"][0]["width"], 2560)
+
+    def test_gsr_build_cmd_includes_desktop_and_microphone_audio(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertIn("-a", cmd)
+        idx = cmd.index("-a")
+        self.assertEqual(cmd[idx + 1], "default_output|default_input")
+
+    def test_gsr_build_cmd_uses_selected_audio_source(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    gsr_audio_source="app:firefox",
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd[cmd.index("-a") + 1], "app:firefox")
+
+    def test_gsr_build_cmd_combines_selected_audio_source_with_microphone(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    gsr_audio_source="device:game.monitor",
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd[cmd.index("-a") + 1], "device:game.monitor|default_input")
+
+    def test_gsr_build_cmd_passes_configured_resolution(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(resolution="1280x720"),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd[cmd.index("-s") + 1], "1280x720")
+
+    def test_gsr_build_cmd_ignores_invalid_resolution(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(resolution="720p"),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertNotIn("-s", cmd)
+
+    def test_gsr_build_cmd_keeps_user_resolution_override(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    resolution="1280x720",
+                    gsr_args="-s 640x360",
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd.count("-s"), 1)
+        self.assertEqual(cmd[cmd.index("-s") + 1], "640x360")
+
+    def test_gsr_session_cmd_passes_configured_resolution(self) -> None:
+        rc = RecordingConfig(resolution="1920x1080")
+
+        cmd = GSRRecorder._gsr_session_cmd(Path("/tmp/vice-test/out.mp4"), rc)
+
+        self.assertEqual(cmd[cmd.index("-s") + 1], "1920x1080")
+
+    def test_gsr_build_cmd_uses_configured_container(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(container="mkv"),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd[cmd.index("-c") + 1], "mkv")
+
+    def test_gsr_build_cmd_falls_back_to_mp4_for_unknown_container(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(container="avi"),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd[cmd.index("-c") + 1], "mp4")
+
+    def test_gsr_build_cmd_emits_one_audio_flag_per_track(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    audio_tracks=["default_output", "default_input", "app:Discord"],
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(
+            audio_values, ["default_output", "default_input", "app:Discord"]
+        )
+
+    def test_gsr_build_cmd_appends_microphone_track_when_mic_enabled(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    audio_tracks=["default_output", "app:Discord"],
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(
+            audio_values, ["default_output", "app:Discord", "default_input"]
+        )
+
+    def test_gsr_build_cmd_does_not_duplicate_microphone_track(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    audio_tracks=["default_output", "default_input"],
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(audio_values, ["default_output", "default_input"])
+
+    def test_gsr_build_cmd_uses_configured_microphone_source_for_tracks(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    microphone_source="device:alsa_input.usb-guitar",
+                    audio_tracks=["default_output"],
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(
+            audio_values, ["default_output", "device:alsa_input.usb-guitar"]
+        )
+
+    def test_gsr_build_cmd_mixed_audio_uses_configured_microphone_source(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    microphone_source="device:alsa_input.usb-guitar",
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(
+            cmd[cmd.index("-a") + 1], "default_output|device:alsa_input.usb-guitar"
+        )
+
+    def test_gsr_build_cmd_drops_tracks_when_desktop_audio_disabled(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=False,
+                    capture_microphone=True,
+                    audio_tracks=["default_output", "app:Discord"],
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(audio_values, ["default_input"])
+
+    def test_gsr_build_cmd_mix_first_prepends_combined_track(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    audio_tracks=["default_output", "app:Discord"],
+                    audio_tracks_mix_first=True,
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(
+            audio_values,
+            [
+                "default_output|app:Discord|default_input",
+                "default_output",
+                "app:Discord",
+                "default_input",
+            ],
+        )
+
+    def test_gsr_build_cmd_mix_first_skipped_for_single_track(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    audio_tracks=["default_output"],
+                    audio_tracks_mix_first=True,
+                ),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        audio_values = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-a"]
+        self.assertEqual(audio_values, ["default_output"])
+
+    def test_wf_audio_device_uses_configured_microphone_source(self) -> None:
+        rc = RecordingConfig(
+            capture_audio=False,
+            capture_microphone=True,
+            microphone_source="device:alsa_input.usb-guitar",
+        )
+
+        self.assertEqual(_wf_audio_device(rc), "alsa_input.usb-guitar")
+
+    def test_gsr_build_cmd_maps_hevc_encoder_to_gsr_codec(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(encoder="hevc_vaapi"),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd[cmd.index("-k") + 1], "hevc")
+
+    def test_gsr_build_cmd_respects_user_codec_arg(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(encoder="hevc_vaapi", gsr_args="-k av1"),
+            )
+        )
+
+        cmd = recorder._build_cmd()
+
+        self.assertEqual(cmd.count("-k"), 1)
+        self.assertEqual(cmd[cmd.index("-k") + 1], "av1")
+
+    def test_gsr_session_cmd_maps_hevc_encoder_to_gsr_codec(self) -> None:
+        cmd = GSRRecorder._gsr_session_cmd(
+            Path("/tmp/session.mp4"),
+            RecordingConfig(encoder="hevc_nvenc"),
+        )
+
+        self.assertEqual(cmd[cmd.index("-k") + 1], "hevc")
+
+    def test_hevc_vaapi_encoder_flags(self) -> None:
+        flags = _encoder_flags("hevc_vaapi", 23)
+
+        self.assertIn("-c:v", flags)
+        self.assertEqual(flags[flags.index("-c:v") + 1], "hevc_vaapi")
+
+    def test_gsr_build_cmd_maps_av1_encoders_to_gsr_codec(self) -> None:
+        for encoder in ("av1_nvenc", "av1_vaapi", "av1"):
+            recorder = GSRRecorder(
+                Config(
+                    output=OutputConfig(directory="/tmp/vice-test"),
+                    recording=RecordingConfig(encoder=encoder),
+                )
+            )
+
+            cmd = recorder._build_cmd()
+
+            self.assertEqual(cmd[cmd.index("-k") + 1], "av1", encoder)
+
+    def test_av1_encoder_flags_use_hardware_branches(self) -> None:
+        nvenc = _encoder_flags("av1_nvenc", 23)
+        vaapi = _encoder_flags("av1_vaapi", 23)
+
+        self.assertIn("-cq", nvenc)
+        self.assertEqual(nvenc[nvenc.index("-c:v") + 1], "av1_nvenc")
+        self.assertIn("-qp", vaapi)
+        self.assertEqual(vaapi[vaapi.index("-c:v") + 1], "av1_vaapi")
+
+    def test_list_gsr_audio_sources_parses_devices_and_apps(self) -> None:
+        def fake_run(cmd, timeout=5.0):
+            if "--list-audio-devices" in cmd:
+                # GSR format: "name|Human description". The default entries
+                # must be deduped against the hardcoded friendly ones.
+                return 0, (
+                    "default_output|Default output\n"
+                    "default_input|Default input\n"
+                    "alsa_output.game.monitor|Monitor of Game Audio\n"
+                )
+            if "--list-application-audio" in cmd:
+                return 0, "Firefox\nDiscord\n"
+            return 1, ""
+
+        with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "gpu-screen-recorder"):
+            with mock.patch("vice.recorder._run_command_capture", side_effect=fake_run):
+                payload = list_gsr_audio_sources()
+
+        ids = [source["id"] for source in payload["sources"]]
+        self.assertIn("default_output", ids)
+        self.assertIn("device:alsa_output.game.monitor", ids)
+        self.assertIn("app:Firefox", ids)
+        self.assertIn("app-inverse:Firefox", ids)
+        # The description must land in the label, never in the id.
+        self.assertEqual(ids.count("default_output"), 1)
+        self.assertNotIn("device:default_output", ids)
+        by_id = {s["id"]: s["label"] for s in payload["sources"]}
+        self.assertEqual(by_id["device:alsa_output.game.monitor"], "Device: Monitor of Game Audio")
+        for source_id in ids:
+            self.assertNotIn("|", source_id)
+
+    def test_gsr_build_cmd_defaults_to_screen_on_x11(self) -> None:
+        recorder = GSRRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test"))
+        )
+
+        with mock.patch("vice.recorder._is_wayland", return_value=False):
+            with mock.patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False):
+                cmd = recorder._build_cmd()
+
+        self.assertIn("-w", cmd)
+        self.assertEqual(cmd[cmd.index("-w") + 1], "screen")
+
+    def test_gsr_build_cmd_uses_selected_display(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(display="DP-1"),
+            )
+        )
+
+        with mock.patch("vice.recorder._display_options", return_value=[{"id": "DP-1", "label": "DP-1"}]):
+            cmd = recorder._build_cmd()
+
+        self.assertIn("-w", cmd)
+        self.assertEqual(cmd[cmd.index("-w") + 1], "DP-1")
+
+    def test_gsr_build_cmd_accepts_legacy_pipe_form_display_value(self) -> None:
+        recorder = GSRRecorder(
+            Config(
+                output=OutputConfig(directory="/tmp/vice-test"),
+                recording=RecordingConfig(display="DP-1|2560x1440"),
+            )
+        )
+
+        with mock.patch(
+            "vice.recorder._display_options",
+            return_value=[{"id": "DP-1", "label": "DP-1 (2560x1440)"}],
+        ):
+            cmd = recorder._build_cmd()
+
+        self.assertIn("-w", cmd)
+        self.assertEqual(cmd[cmd.index("-w") + 1], "DP-1")
+
+    def test_ffmpeg_segment_cmd_mixes_desktop_and_microphone_audio(self) -> None:
+        recorder = SegmentRecorder(
+            Config(
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                )
+            ),
+            use_wf_recorder=False,
+        )
+
+        with mock.patch("vice.recorder._desktop_audio_source", return_value="desk.monitor"):
+            with mock.patch("vice.recorder._microphone_audio_source", return_value="mic.input"):
+                cmd = recorder._ffmpeg_x11_cmd(Path("/tmp/out.mp4"))
+
+        self.assertIn("desk.monitor", cmd)
+        self.assertIn("mic.input", cmd)
+        self.assertIn("-filter_complex", cmd)
+        self.assertIn("[1:a][2:a]amix=inputs=2:normalize=0[aout]", cmd)
+
+    def test_ffmpeg_segment_cmd_uses_selected_monitor_geometry(self) -> None:
+        recorder = SegmentRecorder(
+            Config(
+                recording=RecordingConfig(
+                    display="DP-1",
+                    resolution="1920x1080",
+                )
+            ),
+            use_wf_recorder=False,
+        )
+
+        displays = [{"id": "DP-1", "label": "DP-1", "width": 2560, "height": 1440, "x": 1920, "y": 0}]
+        with mock.patch("vice.recorder._display_options", return_value=displays):
+            cmd = recorder._ffmpeg_x11_cmd(Path("/tmp/out.mp4"))
+
+        self.assertIn("-video_size", cmd)
+        self.assertEqual(cmd[cmd.index("-video_size") + 1], "2560x1440")
+        self.assertIn("-i", cmd)
+        self.assertEqual(cmd[cmd.index("-i") + 1], ":0+1920,0")
+        self.assertIn("-vf", cmd)
+        self.assertIn("scale=1920:1080", cmd[cmd.index("-vf") + 1])
+
+    def test_wf_recorder_uses_microphone_only_strategy(self) -> None:
+        recorder = SegmentRecorder(
+            Config(
+                recording=RecordingConfig(
+                    capture_audio=True,
+                    capture_microphone=True,
+                    wf_microphone_strategy="mic_only",
+                )
+            ),
+            use_wf_recorder=True,
+        )
+
+        with mock.patch("vice.recorder._microphone_audio_source", return_value="mic.input"):
+            cmd = recorder._wf_recorder_cmd(Path("/tmp/out.mp4"))
+
+        self.assertIn("--audio=mic.input", cmd)
+
+    def test_wf_recorder_uses_selected_display(self) -> None:
+        recorder = SegmentRecorder(
+            Config(recording=RecordingConfig(display="DP-1")),
+            use_wf_recorder=True,
+        )
+
+        with mock.patch("vice.recorder._display_options", return_value=[{"id": "DP-1", "label": "DP-1"}]):
+            with mock.patch("vice.recorder._wf_supports_flag", return_value=False):
+                cmd = recorder._wf_recorder_cmd(Path("/tmp/out.mp4"))
+
+        self.assertIn("-o", cmd)
+        self.assertEqual(cmd[cmd.index("-o") + 1], "DP-1")
+        self.assertNotIn("--force-yuv", cmd)
+
+    def test_wf_recorder_includes_force_yuv_when_supported(self) -> None:
+        recorder = SegmentRecorder(
+            Config(recording=RecordingConfig()),
+            use_wf_recorder=True,
+        )
+
+        with mock.patch("vice.recorder._wf_supports_flag", return_value=True):
+            cmd = recorder._wf_recorder_cmd(Path("/tmp/out.mp4"))
+
+        self.assertIn("--force-yuv", cmd)
+
+    def test_list_display_options_warns_for_legacy_wf_recorder_listing(self) -> None:
+        proc = subprocess.CompletedProcess(
+            ["wf-recorder", "-L"],
+            1,
+            "",
+            "wf-recorder: invalid option -- 'L'\nUnsupported command line argument (null)\n",
+        )
+
+        with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "wf-recorder"):
+            with mock.patch("vice.recorder.subprocess.run", return_value=proc):
+                info = list_display_options("wf-recorder")
+
+        self.assertEqual(info["backend"], "wf-recorder")
+        self.assertEqual(info["displays"], [])
+        self.assertEqual(
+            info["warning"],
+            "installed wf-recorder does not support output listing (-L)",
+        )
+
+    def test_create_recorder_uses_compat_backend_for_wf_microphone_mode(self) -> None:
+        cfg = Config(
+            recording=RecordingConfig(
+                backend="wf-recorder",
+                capture_audio=True,
+                capture_microphone=True,
+                wf_microphone_strategy="backend_fallback",
+            )
+        )
+
+        with mock.patch("vice.recorder._has") as has_mock:
+            with mock.patch("vice.recorder._is_wayland", return_value=True):
+                with mock.patch("vice.recorder._is_x11", return_value=False):
+                    has_mock.side_effect = lambda tool: tool == "gpu-screen-recorder"
+                    recorder = create_recorder(cfg)
+
+        self.assertIsInstance(recorder, GSRRecorder)
+
+    def test_create_recorder_rejects_wf_microphone_prompt_mode(self) -> None:
+        cfg = Config(
+            recording=RecordingConfig(
+                backend="wf-recorder",
+                capture_audio=True,
+                capture_microphone=True,
+                wf_microphone_strategy="prompt",
+            )
+        )
+
+        with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "wf-recorder"):
+            with mock.patch("vice.recorder._is_wayland", return_value=True):
+                with mock.patch("vice.recorder._is_x11", return_value=False):
+                    with self.assertRaises(RuntimeError):
+                        create_recorder(cfg)
+
+    def test_create_recorder_reports_missing_wayland_backend(self) -> None:
+        cfg = Config(recording=RecordingConfig(backend="auto"))
+
+        with mock.patch("vice.recorder._has", return_value=False):
+            with mock.patch("vice.recorder._is_wayland", return_value=True):
+                with mock.patch("vice.recorder._is_x11", return_value=False):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        create_recorder(cfg)
+
+        self.assertIn("gpu-screen-recorder is required", str(ctx.exception))
+        self.assertIn("recording.backend", str(ctx.exception))
+
+
+class _FakeStream:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
+class _FakeProcess:
+    def __init__(self, returncode: int, stderr: bytes = b"") -> None:
+        self.returncode = returncode
+        self.stderr = _FakeStream(stderr)
+
+    async def wait(self) -> int:
+        return self.returncode
+
+    def terminate(self) -> None:
+        return None
+
+
+class RecorderSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gsr_start_raises_when_process_exits_immediately(self) -> None:
+        recorder = GSRRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test"))
+        )
+        proc = _FakeProcess(
+            2,
+            b"gpu-screen-recorder: invalid capture target DP-1|2560x1440\n",
+        )
+
+        with mock.patch(
+            "vice.recorder.asyncio.create_subprocess_exec",
+            new=mock.AsyncMock(return_value=proc),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await recorder.start()
+
+        self.assertIn("gpu-screen-recorder failed to start", str(ctx.exception))
+
+    async def test_gsr_start_reports_error_line_instead_of_monitor_listing(self) -> None:
+        recorder = GSRRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test"))
+        )
+        proc = _FakeProcess(
+            2,
+            b"gpu-screen-recorder: invalid capture target :0\n"
+            b"Available monitors:\n"
+            b'"DP-4" (1920x1080+1920+0)\n',
+        )
+
+        with mock.patch(
+            "vice.recorder.asyncio.create_subprocess_exec",
+            new=mock.AsyncMock(return_value=proc),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await recorder.start()
+
+        message = str(ctx.exception)
+        self.assertIn("invalid capture target :0", message)
+        self.assertNotIn('"DP-4"', message)
+
+    async def test_segment_start_raises_when_first_segment_exits_immediately(self) -> None:
+        recorder = SegmentRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test")),
+            use_wf_recorder=True,
+        )
+        proc = _FakeProcess(
+            2,
+            b"wf-recorder: unknown output DP-1\n",
+        )
+
+        with mock.patch("vice.recorder._wf_supports_flag", return_value=False):
+            with mock.patch(
+                "vice.recorder.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=proc),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    await recorder.start()
+
+        self.assertIn("wf-recorder failed to start", str(ctx.exception))
+
+    async def test_start_session_returns_none_when_recorder_exits_immediately(self) -> None:
+        recorder = SegmentRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test")),
+            use_wf_recorder=True,
+        )
+        proc = _FakeProcess(
+            2,
+            b"wf-recorder: unrecognized option '--force-yuv'\n",
+        )
+
+        with mock.patch("vice.recorder._is_wayland", return_value=True):
+            with mock.patch("vice.recorder._has", side_effect=lambda tool: tool == "wf-recorder"):
+                with mock.patch("vice.recorder._wf_supports_flag", return_value=False):
+                    with mock.patch(
+                        "vice.recorder.asyncio.create_subprocess_exec",
+                        new=mock.AsyncMock(return_value=proc),
+                    ):
+                        path = await recorder.start_session()
+
+        self.assertIsNone(path)
+
+
+class RecordingLimitTests(unittest.TestCase):
+    def test_load_clamps_oversized_durations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+            config_path.write_text(
+                "[recording]\n"
+                "buffer_duration = 999999\n"
+                "clip_duration = 99999\n"
+                "gsr_replay_storage = \"floppy\"\n"
+            )
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    loaded = config_mod.load()
+
+        self.assertEqual(loaded.recording.clip_duration, 1800)
+        self.assertEqual(loaded.recording.buffer_duration, 1800)
+        self.assertEqual(loaded.recording.gsr_replay_storage, "auto")
+
+    def test_clamp_falls_back_on_non_numeric_values(self) -> None:
+        cfg = Config(recording=RecordingConfig())
+        cfg.recording.buffer_duration = "lots"
+        cfg.recording.clip_duration = None
+        config_mod.clamp_recording_limits(cfg)
+
+        self.assertEqual(cfg.recording.clip_duration, 20)
+        self.assertEqual(cfg.recording.buffer_duration, 120)
+
+    def test_clamp_keeps_buffer_covering_clip(self) -> None:
+        cfg = Config(recording=RecordingConfig(buffer_duration=30, clip_duration=300))
+        config_mod.clamp_recording_limits(cfg)
+
+        self.assertEqual(cfg.recording.clip_duration, 300)
+        self.assertGreaterEqual(cfg.recording.buffer_duration, 300)
+
+    def test_replay_storage_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".config" / "vice"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+
+            with mock.patch.object(config_mod, "CONFIG_DIR", config_dir):
+                with mock.patch.object(config_mod, "CONFIG_PATH", config_path):
+                    config_mod.save(Config(recording=RecordingConfig(gsr_replay_storage="disk")))
+                    loaded = config_mod.load()
+
+        self.assertEqual(loaded.recording.gsr_replay_storage, "disk")
+
+
+class ReplayStorageCommandTests(unittest.TestCase):
+    def _cmd(self, rc: RecordingConfig) -> list[str]:
+        recorder = GSRRecorder(
+            Config(output=OutputConfig(directory="/tmp/vice-test"), recording=rc)
+        )
+        return recorder._build_cmd()
+
+    def test_wants_disk_replay_matrix(self) -> None:
+        self.assertTrue(_gsr_wants_disk_replay(RecordingConfig(gsr_replay_storage="disk")))
+        self.assertTrue(_gsr_wants_disk_replay(
+            RecordingConfig(gsr_replay_storage="auto", buffer_duration=601)))
+        self.assertFalse(_gsr_wants_disk_replay(
+            RecordingConfig(gsr_replay_storage="auto", buffer_duration=600)))
+        self.assertFalse(_gsr_wants_disk_replay(
+            RecordingConfig(gsr_replay_storage="ram", buffer_duration=1800)))
+
+    def test_default_config_emits_no_storage_flag(self) -> None:
+        with mock.patch("vice.recorder._gsr_supports_flag", return_value=True):
+            cmd = self._cmd(RecordingConfig())
+        self.assertNotIn("-replay-storage", cmd)
+
+    def test_long_auto_buffer_uses_disk_when_supported(self) -> None:
+        rc = RecordingConfig(buffer_duration=1200)
+        with mock.patch("vice.recorder._gsr_supports_flag", return_value=True):
+            cmd = self._cmd(rc)
+        self.assertEqual(cmd[cmd.index("-replay-storage") + 1], "disk")
+
+    def test_storage_flag_omitted_when_gsr_lacks_it(self) -> None:
+        rc = RecordingConfig(buffer_duration=1200)
+        with mock.patch("vice.recorder._gsr_supports_flag", return_value=False):
+            cmd = self._cmd(rc)
+        self.assertNotIn("-replay-storage", cmd)
+
+    def test_user_gsr_args_storage_flag_wins(self) -> None:
+        rc = RecordingConfig(buffer_duration=1200, gsr_args="-replay-storage ram")
+        with mock.patch("vice.recorder._gsr_supports_flag", return_value=True):
+            cmd = self._cmd(rc)
+        self.assertEqual(cmd.count("-replay-storage"), 1)
+        self.assertEqual(cmd[cmd.index("-replay-storage") + 1], "ram")
+
+
+class AudioSourceClassificationTests(unittest.TestCase):
+    def test_classify_matrix(self) -> None:
+        cases = {
+            "default_output": "monitor",
+            "default_input": "input",
+            "device:alsa_output.pci-0000.analog-stereo.monitor": "monitor",
+            "device:alsa_input.usb-Focusrite_Scarlett-00.pro-input-0": "input",
+            "app:Discord": "app",
+            "app-inverse:firefox": "app",
+            "": "unknown",
+            "garbage": "unknown",
+        }
+        for source, expected in cases.items():
+            self.assertEqual(_classify_gsr_source(source), expected, source)
+
+    def test_desktop_toggle_off_keeps_microphone_tracks(self) -> None:
+        rc = RecordingConfig(
+            capture_audio=False,
+            capture_microphone=True,
+            audio_tracks=["default_output|default_input", "app:Discord"],
+        )
+
+        args = _gsr_audio_args(rc)
+
+        self.assertEqual(args, ["-a", "default_input"])
+
+    def test_desktop_toggle_off_without_tracks_still_records_mic(self) -> None:
+        rc = RecordingConfig(capture_audio=False, capture_microphone=True)
+
+        self.assertEqual(_gsr_audio_args(rc), ["-a", "default_input"])
+
+    def test_audio_sources_report_kind(self) -> None:
+        def fake_run(cmd, timeout=5.0):
+            if "--list-audio-devices" in cmd:
+                return 0, (
+                    "alsa_output.pci-0000.analog-stereo.monitor|Speakers\n"
+                    "alsa_input.usb-mic|USB Mic\n"
+                )
+            return 0, "Discord\n"
+
+        with mock.patch("vice.recorder._has", return_value=True):
+            with mock.patch("vice.recorder._run_command_capture", side_effect=fake_run):
+                info = list_gsr_audio_sources()
+
+        kinds = {s["id"]: s.get("kind") for s in info["sources"]}
+        self.assertEqual(kinds["default_output"], "monitor")
+        self.assertEqual(kinds["default_input"], "input")
+        self.assertEqual(kinds["device:alsa_output.pci-0000.analog-stereo.monitor"], "monitor")
+        self.assertEqual(kinds["device:alsa_input.usb-mic"], "input")
+        self.assertEqual(kinds["app:Discord"], "app")
+        self.assertEqual(kinds["app-inverse:Discord"], "app")
+
+
+class GSRHealthTests(unittest.TestCase):
+    def _recorder(self) -> GSRRecorder:
+        return GSRRecorder(Config(output=OutputConfig(directory="/tmp/vice-test")))
+
+    def test_healthy_requires_running_live_process(self) -> None:
+        class _Proc:
+            returncode = None
+
+        recorder = self._recorder()
+        self.assertFalse(recorder.is_healthy())
+
+        recorder._running = True
+        self.assertFalse(recorder.is_healthy())
+
+        recorder._proc = _Proc()
+        self.assertTrue(recorder.is_healthy())
+
+        recorder._proc.returncode = 1
+        self.assertFalse(recorder.is_healthy())
+
+
+class RecorderWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    def _daemon(self, recorder: _FakeRecorder) -> main_mod.ViceDaemon:
+        with mock.patch("vice.main.load_config", return_value=Config()):
+            with mock.patch("vice.main.create_recorder", return_value=recorder):
+                with mock.patch("vice.main.HotkeyListener", return_value=_FakeHotkeys()):
+                    with mock.patch("vice.main.can_access_hotkeys", return_value=True):
+                        daemon = main_mod.ViceDaemon()
+        daemon.share = _FakeShare()
+        return daemon
+
+    async def _run_watchdog(self, daemon, max_sleeps: int, wall_times=None):
+        sleeps: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= max_sleeps:
+                raise asyncio.CancelledError
+
+        patches = [mock.patch("vice.main.asyncio.sleep", fake_sleep)]
+        if wall_times is not None:
+            patches.append(mock.patch("vice.main.time.time", side_effect=wall_times))
+        with patches[0]:
+            ctx = patches[1] if len(patches) > 1 else None
+            try:
+                if ctx:
+                    with ctx:
+                        await daemon._recorder_watchdog_loop()
+                else:
+                    await daemon._recorder_watchdog_loop()
+            except asyncio.CancelledError:
+                pass
+        return sleeps
+
+    async def test_dead_recorder_is_restarted(self) -> None:
+        recorder = _FakeRecorder()
+        recorder.healthy = False
+        recorder.heal_on_start = True
+        daemon = self._daemon(recorder)
+
+        await self._run_watchdog(daemon, max_sleeps=3)
+        await asyncio.sleep(0)
+
+        self.assertEqual(recorder.stop_calls, 1)
+        self.assertEqual(recorder.start_calls, 1)
+        self.assertTrue(
+            any(m.get("recording") for m in daemon.share.messages),
+            daemon.share.messages,
+        )
+
+    async def test_healthy_recorder_is_left_alone(self) -> None:
+        recorder = _FakeRecorder()
+        daemon = self._daemon(recorder)
+
+        await self._run_watchdog(daemon, max_sleeps=4)
+
+        self.assertEqual(recorder.start_calls, 0)
+        self.assertEqual(recorder.stop_calls, 0)
+
+    async def test_wall_clock_jump_restarts_healthy_recorder(self) -> None:
+        recorder = _FakeRecorder()
+        daemon = self._daemon(recorder)
+
+        wall = [1000.0, 2000.0] + [2000.0 + i * 5 for i in range(1, 20)]
+        await self._run_watchdog(daemon, max_sleeps=3, wall_times=wall)
+
+        self.assertEqual(recorder.stop_calls, 1)
+        self.assertEqual(recorder.start_calls, 1)
+
+    async def test_recovered_before_lock_skips_restart(self) -> None:
+        recorder = _FakeRecorder()
+        recorder.is_healthy = mock.Mock(side_effect=[False, True, True, True, True])
+        daemon = self._daemon(recorder)
+
+        await self._run_watchdog(daemon, max_sleeps=3)
+
+        self.assertEqual(recorder.start_calls, 0)
+
+    async def test_failed_restart_backs_off(self) -> None:
+        recorder = _FakeRecorder()
+        recorder.healthy = False
+        recorder.start_error = RuntimeError("driver gone")
+        daemon = self._daemon(recorder)
+
+        sleeps = await self._run_watchdog(daemon, max_sleeps=5)
+        await asyncio.sleep(0)
+
+        self.assertEqual(sleeps, [5.0, 5.0, 5.0, 10.0, 5.0])
+        self.assertTrue(
+            any(m.get("recording") is False for m in daemon.share.messages),
+            daemon.share.messages,
+        )
+
+
+class VolumeBalanceTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_volumes_keep_audio_args_identical(self) -> None:
+        rc = RecordingConfig(capture_audio=True, capture_microphone=True)
+
+        self.assertEqual(_gsr_audio_args(rc), ["-a", "default_output|default_input"])
+
+    def test_non_default_volume_splits_desktop_and_mic_tracks(self) -> None:
+        rc = RecordingConfig(
+            capture_audio=True, capture_microphone=True, microphone_volume=0.5
+        )
+
+        self.assertEqual(
+            _gsr_audio_args(rc),
+            ["-a", "default_output", "-a", "default_input"],
+        )
+
+    def test_session_commands_never_split_for_volume(self) -> None:
+        rc = RecordingConfig(
+            capture_audio=True, capture_microphone=True, microphone_volume=0.5
+        )
+
+        self.assertEqual(
+            _gsr_audio_args(rc, split_for_volume=False),
+            ["-a", "default_output|default_input"],
+        )
+
+    def test_separate_tracks_ignore_volume_split(self) -> None:
+        rc = RecordingConfig(
+            capture_audio=True,
+            capture_microphone=True,
+            microphone_volume=0.5,
+            audio_tracks=["default_output", "app:Discord"],
+        )
+
+        args = _gsr_audio_args(rc)
+
+        self.assertEqual(args.count("-a"), 3)  # tracks + auto-appended mic
+
+    def test_volume_mix_cmd_two_streams(self) -> None:
+        from vice.recorder import _volume_mix_cmd
+
+        cmd = _volume_mix_cmd(Path("/tmp/c.mp4"), Path("/tmp/c.mix.mp4"), 2, 1.0, 0.5)
+
+        joined = " ".join(cmd)
+        self.assertIn("volume=1.0[a0]", joined)
+        self.assertIn("volume=0.5[a1]", joined)
+        self.assertIn("amix=inputs=2:normalize=0", joined)
+        self.assertIn("-c:v copy", joined)
+        self.assertIn("-c:a aac", joined)
+        self.assertIn("+faststart", joined)
+
+    def test_volume_mix_cmd_mkv_uses_opus(self) -> None:
+        from vice.recorder import _volume_mix_cmd
+
+        cmd = _volume_mix_cmd(Path("/tmp/c.mkv"), Path("/tmp/c.mix.mkv"), 2, 1.0, 0.5)
+
+        joined = " ".join(cmd)
+        self.assertIn("-c:a libopus", joined)
+        self.assertNotIn("+faststart", joined)
+
+    async def test_apply_volume_mix_noop_at_defaults(self) -> None:
+        from vice.recorder import _apply_volume_mix
+
+        rc = RecordingConfig(capture_audio=True, capture_microphone=True)
+        with mock.patch("vice.recorder._count_audio_streams") as probe:
+            await _apply_volume_mix(Path("/tmp/c.mp4"), rc)
+
+        probe.assert_not_called()
+
+    async def test_apply_volume_mix_skips_single_mixed_track(self) -> None:
+        from vice.recorder import _apply_volume_mix
+
+        rc = RecordingConfig(
+            capture_audio=True, capture_microphone=True, microphone_volume=0.5
+        )
+        with mock.patch("vice.recorder._count_audio_streams", return_value=1):
+            with mock.patch("asyncio.create_subprocess_exec") as spawn:
+                await _apply_volume_mix(Path("/tmp/c.mp4"), rc)
+
+        spawn.assert_not_called()
+
+    async def test_apply_volume_mix_skips_user_defined_tracks(self) -> None:
+        from vice.recorder import _apply_volume_mix
+
+        rc = RecordingConfig(
+            capture_audio=True,
+            capture_microphone=True,
+            microphone_volume=0.5,
+            audio_tracks=["default_output", "app:Discord"],
+        )
+        with mock.patch("vice.recorder._count_audio_streams") as probe:
+            await _apply_volume_mix(Path("/tmp/c.mp4"), rc)
+
+        probe.assert_not_called()
+
+    def test_clamp_bounds_volumes(self) -> None:
+        cfg = Config(recording=RecordingConfig(desktop_volume=9.0, microphone_volume=-1))
+        config_mod.clamp_recording_limits(cfg)
+
+        self.assertEqual(cfg.recording.desktop_volume, 2.0)
+        self.assertEqual(cfg.recording.microphone_volume, 0.0)
+
+
+class ClipNameTemplateTests(unittest.TestCase):
+    """#118: let users name clips themselves without ever losing one."""
+
+    NOW = datetime(2026, 7, 19, 16, 0)
+
+    def test_renders_every_token(self) -> None:
+        self.assertEqual(
+            _render_clip_name("clip_$date_$time", 1, None, self.NOW),
+            "clip_2026-07-19_1600",
+        )
+        self.assertEqual(
+            _render_clip_name("$game_$n", 4, "Overwatch-2", self.NOW),
+            "Overwatch-2_4",
+        )
+
+    def test_missing_game_leaves_no_dangling_separators(self) -> None:
+        self.assertEqual(_render_clip_name("clip_$game_$n", 4, None, self.NOW), "clip_4")
+        self.assertEqual(_render_clip_name("$game-$n", 2, None, self.NOW), "2")
+
+    def test_template_cannot_escape_the_output_directory(self) -> None:
+        name = _render_clip_name("../../etc/passwd_$n", 1, None, self.NOW)
+
+        self.assertNotIn("/", name)
+        self.assertNotIn("..", name)
+
+    def test_empty_template_keeps_default_naming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+
+            self.assertEqual(_next_clip_path(out).name, "Vice_Clip_1.mp4")
+            self.assertEqual(_next_clip_path(out, template="").name, "Vice_Clip_1.mp4")
+
+    def test_numbering_continues_across_saves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            names = []
+            for _ in range(3):
+                path = _next_clip_path(out, template="Rec-$n")
+                path.touch()
+                names.append(path.name)
+
+            self.assertEqual(names, ["Rec-1.mp4", "Rec-2.mp4", "Rec-3.mp4"])
+
+    def test_numbering_counts_other_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "Rec-7.mkv").touch()
+
+            self.assertEqual(_next_clip_path(out, template="Rec-$n").name, "Rec-8.mp4")
+
+    def test_template_without_number_never_overwrites(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            first = _next_clip_path(out, template="clip_$date")
+            first.touch()
+            second = _next_clip_path(out, template="clip_$date")
+
+            self.assertNotEqual(first, second)
+            self.assertTrue(second.name.endswith("_2.mp4"))
+
+    def test_unusable_template_falls_back_to_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            # $game is empty when no game is detected, leaving nothing at all.
+            self.assertEqual(
+                _next_clip_path(out, template="$game").name, "Vice_Clip_1.mp4"
+            )
+
+
+class AudioTrackPreservationTests(unittest.IsolatedAsyncioTestCase):
+    """Every ffmpeg pass over a clip must keep all audio tracks. Without an
+    explicit map, ffmpeg keeps one, which silently dropped the mic from clips
+    recorded with split desktop/mic tracks (#119)."""
+
+    @staticmethod
+    def _make_two_track_clip(path: Path) -> None:
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=6",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+                "-f", "lavfi", "-i", "sine=frequency=880:duration=6",
+                "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                "-y", str(path),
+            ],
+            check=True,
+        )
+
+    @staticmethod
+    def _audio_stream_count(path: Path) -> int:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return len([line for line in out.splitlines() if line.strip()])
+
+    def test_trim_and_watermark_commands_map_every_stream(self) -> None:
+        from vice.recorder import KEEP_ALL_AUDIO, KEEP_ALL_STREAMS
+
+        self.assertEqual(KEEP_ALL_STREAMS, ["-map", "0:v?", "-map", "0:a?"])
+        # The watermark pass filters video, which needs a single video input.
+        self.assertEqual(KEEP_ALL_AUDIO, ["-map", "0:v:0?", "-map", "0:a?"])
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed"
+    )
+    async def test_trim_keeps_both_audio_tracks(self) -> None:
+        from vice.recorder import _trim_to_last_n_seconds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clip = Path(tmpdir) / "Vice_Clip_1.mp4"
+            self._make_two_track_clip(clip)
+            self.assertEqual(self._audio_stream_count(clip), 2)
+
+            await _trim_to_last_n_seconds(clip, 3)
+
+            self.assertEqual(self._audio_stream_count(clip), 2)
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed"
+    )
+    async def test_volume_mix_balances_both_tracks_into_one(self) -> None:
+        from vice.recorder import _apply_volume_mix
+
+        rc = RecordingConfig(
+            capture_audio=True, capture_microphone=True, microphone_volume=0.5
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clip = Path(tmpdir) / "Vice_Clip_1.mp4"
+            self._make_two_track_clip(clip)
+
+            await _apply_volume_mix(clip, rc)
+
+            self.assertEqual(self._audio_stream_count(clip), 1)
+
+
+
+class UpdateNoticeTests(unittest.IsolatedAsyncioTestCase):
+    """The daemon side of the update check. Installed version is the real
+    __version__, so the fixtures are chosen relative to it."""
+
+    def _daemon(self):
+        from vice.config import Config
+        from vice.main import ViceDaemon
+
+        daemon = ViceDaemon.__new__(ViceDaemon)
+        daemon.cfg = Config()
+        daemon._update = None
+        daemon.share = mock.MagicMock()
+        daemon.share.broadcast = mock.AsyncMock()
+        return daemon
+
+    async def _run(self, daemon, tmp, latest):
+        from vice import updates as up
+        from vice.main import ViceDaemon
+
+        cache = up.UpdateCache(Path(tmp) / "update.json")
+        with mock.patch.object(up, "UpdateCache", return_value=cache):
+            with mock.patch.object(up, "fetch_latest", return_value=latest) as fetch:
+                with mock.patch.object(
+                        ViceDaemon, "_update_install_hint",
+                        return_value={"method": "aur",
+                                      "command": "yay -Syu vice-clipper"}):
+                    found = await daemon.run_update_check()
+        return found, fetch, cache
+
+    @staticmethod
+    def _bump(version, by=1):
+        parts = [int(p) for p in version.split(".")]
+        parts[1] += by
+        return ".".join(str(p) for p in parts)
+
+    async def test_newer_release_is_broadcast_with_the_install_command(self) -> None:
+        from vice import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = self._daemon()
+            latest = {"version": self._bump(__version__), "url": "https://x/rel",
+                      "notes": ["Something good"], "etag": 'W/"e"'}
+            found, _, _ = await self._run(daemon, tmp, latest)
+
+        self.assertEqual(found["version"], self._bump(__version__))
+        self.assertEqual(found["install"]["command"], "yay -Syu vice-clipper")
+        msg = daemon.share.broadcast.await_args.args[0]
+        self.assertEqual(msg["type"], "update_available")
+        self.assertEqual(msg["notes"], ["Something good"])
+
+    async def test_an_older_release_says_nothing(self) -> None:
+        from vice import __version__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = self._daemon()
+            latest = {"version": self._bump(__version__, -1), "url": "https://x",
+                      "notes": [], "etag": None}
+            found, _, _ = await self._run(daemon, tmp, latest)
+
+        self.assertIsNone(found)
+        self.assertIsNone(daemon._update)
+        daemon.share.broadcast.assert_not_awaited()
+
+    async def test_a_failed_fetch_says_nothing_but_still_marks_the_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = self._daemon()
+            found, _, cache = await self._run(daemon, tmp, None)
+
+            self.assertIsNone(found)
+            daemon.share.broadcast.assert_not_awaited()
+            # The timestamp still moves, so a dead network is not retried on
+            # every launch.
+            self.assertIn("checked_at", cache.load())
+
+    async def test_a_fresh_cache_is_not_refetched(self) -> None:
+        from vice import __version__, updates as up
+        from vice.main import ViceDaemon
+
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = self._daemon()
+            cache = up.UpdateCache(Path(tmp) / "update.json")
+            cache.save({"version": self._bump(__version__), "url": "https://x",
+                        "notes": [], "checked_at": time.time()})
+            with mock.patch.object(up, "UpdateCache", return_value=cache):
+                with mock.patch.object(up, "fetch_latest") as fetch:
+                    with mock.patch.object(
+                            ViceDaemon, "_update_install_hint",
+                            return_value={"method": "aur",
+                                          "command": "yay -Syu vice-clipper"}):
+                        found = await daemon.run_update_check()
+
+        fetch.assert_not_called()
+        self.assertEqual(found["version"], self._bump(__version__))
