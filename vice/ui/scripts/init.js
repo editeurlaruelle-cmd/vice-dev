@@ -26,6 +26,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const savedTheme = localStorage.getItem('vice-theme') || 'blue';
   setTheme(savedTheme, /*persist*/false);
 
+  // Language: load before first paint so labels don't flash in English
+  const savedLang = localStorage.getItem('vice-language') || I18N_DEFAULT_LANG;
+  applyLanguage(savedLang, /*persist*/false);
+
   renderGreeting();
   populateHomeFromCfg();
   syncFormFromCfg();
